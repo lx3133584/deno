@@ -2192,6 +2192,16 @@ impl NetDescriptor {
     if hostname.starts_with('[') {
       if let Some((ip, after)) = hostname.split_once(']') {
         let ip_str = &ip[1..];
+        // A range keeps its prefix length after the closing bracket, so the
+        // bracket has to be dropped before the subnet parser sees the whole
+        // form; `[fc00::]/7` is the same range as `fc00::/7`.
+        if let Some(prefix) = after.strip_prefix('/') {
+          let subnet = format!("{ip_str}/{prefix}");
+          let ip_subnet = subnet.parse::<IpNet>().map_err(|_| {
+            NetDescriptorParseError::InvalidHost(hostname.to_string())
+          })?;
+          return Ok(NetDescriptor(Host::IpSubnet(ip_subnet), None));
+        }
         let ip =
           strip_ipv6_zone_index(ip_str)
             .parse::<Ipv6Addr>()
@@ -6208,6 +6218,47 @@ mod tests {
         )
         .is_err(),
       "deny-read bypass via fi ligature equivalence"
+    );
+  }
+
+  #[test]
+  fn test_net_descriptor_accepts_ipv6_cidr_ranges() {
+    for text in ["[::1]/128", "[fc00::]/7", "[2001:db8::]/32"] {
+      let descriptor = NetDescriptor::parse_for_query(text)
+        .unwrap_or_else(|e| panic!("{text} should parse: {e}"));
+      assert!(
+        matches!(descriptor.0, Host::IpSubnet(_)),
+        "{text} should be a subnet, got {:?}",
+        descriptor.0
+      );
+    }
+  }
+
+  #[test]
+  fn test_net_descriptor_denies_ipv6_cidr_membership() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_net: Some(svec!["[fc00::]/7"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    let inside =
+      NetDescriptor(Host::parse_for_query("fc00::1").unwrap(), Some(8000));
+    assert!(
+      perms.net.check(&inside, None).is_ok(),
+      "an address inside the allowed range should pass"
+    );
+
+    let outside =
+      NetDescriptor(Host::parse_for_query("2001:db8::1").unwrap(), Some(8000));
+    assert!(
+      perms.net.check(&outside, None).is_err(),
+      "an address outside the allowed range should be denied"
     );
   }
 
